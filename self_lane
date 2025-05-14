@@ -1,0 +1,192 @@
+model3 = blueprints.filter('vehicle.tesla.model3');
+bp = cell(py.list(model3));  % 转换为 MATLAB cell 数组
+bp = bp{1};                  % ✅ 正确地取出第一个 blueprint
+
+spawn_points = py.list(map.get_spawn_points());
+ego_spawn  = spawn_points{99};
+ego_loc = ego_spawn.location;
+
+vehicle_ego = world.spawn_actor(bp, ego_spawn);
+
+%% 生成前后车
+% 前车：自车前方 50m
+front_spawn = py.carla.Transform( ...
+    py.carla.Location(ego_loc.x , ego_loc.y + 50, ego_loc.z), ...
+    ego_spawn.rotation);
+
+% 后车：自车后方 25m
+rear_spawn = py.carla.Transform( ...
+    py.carla.Location(ego_loc.x , ego_loc.y -20, ego_loc.z), ...
+    ego_spawn.rotation);
+
+
+
+vehicle_front = world.spawn_actor(bp, front_spawn);
+vehicle_rear  = world.spawn_actor(bp, rear_spawn);
+
+
+
+
+
+%% === （前面：spawn + Autopilot） ===
+% 关闭 Autopilot，并设定初速度
+v_init = 25;  % m/s，大约 90 km/h
+v_vec  = py.carla.Vector3D(0, v_init, 0);
+
+v_vec_f  = py.carla.Vector3D(0, 20, 0);
+v_vec_r  = py.carla.Vector3D(0, 23, 0);
+
+% 自车先匀速行驶（BehaviorAgent 启动前）
+vehicle_ego.set_autopilot(false);
+vehicle_ego.set_target_velocity(v_vec);
+
+% 前后车一开始也行驶
+vehicle_front.set_autopilot(false);
+vehicle_front.set_target_velocity(v_vec_f);
+vehicle_rear.set_autopilot(false);
+vehicle_rear.set_target_velocity(v_vec_r);
+
+%% === 等待 10 秒，让车辆都以 Autopilot 先行驶 ===
+fprintf("等待 10 秒进入 MRM 阶段...\n");
+t0 = world.wait_for_tick().timestamp.elapsed_seconds;
+while true
+    snap = world.wait_for_tick();
+    if (snap.timestamp.elapsed_seconds - t0) >= 8
+        break;
+    end
+end
+fprintf("⏱️ 进入 MRM 阶段，自车接管手动控制\n");
+
+% 切断自车 Autopilot，开始手动 MRM 控制
+vehicle_ego.set_autopilot(false);
+
+snap0 = world.wait_for_tick();  
+t0   = snap0.timestamp.elapsed_seconds;
+
+
+
+
+%初始化数组绘图
+t_log = [];
+TTC_front_log = [];
+TTC_rear_log = [];
+THW_front_log = [];
+THW_rear_log = [];
+
+
+
+
+
+
+%% === MRM 控制循环 ===
+prevSpeed = 0;
+dt      = 0.05;        % 与 world.wait_for_tick() 匹配
+g       = 9.8;         % 重力加速度，用于 brake 换算
+tol_v   = 0.1;         % 低速阈值：认为已停车
+
+
+while true
+    vehicle_front.set_autopilot(true);
+    vehicle_rear.set_autopilot(true);
+    % 在等待 10 秒 MRM 之前记录 t0
+    snap = world.wait_for_tick();
+    simTime = snap.timestamp.elapsed_seconds;
+
+    % 计算相对时间（从 t0 开始）
+    
+      % … 等 10s 逻辑 …
+      % 进入 MRM 循环时，用相对时间
+     t_rel = simTime - t0;
+
+
+     
+    % ———— 1) 读位置与速度 ————
+    ego_loc = vehicle_ego.get_location();
+    front_loc = vehicle_front.get_location();
+    ego_vvec = vehicle_ego.get_velocity();
+    front_vvec = vehicle_front.get_velocity();
+    
+    % 只取朝 y 方向的标量速度（假设道路沿 Y 轴）
+    v_ego   = double(ego_vvec.y);
+    v_front = double(front_vvec.y);
+    
+    % ———— 2) 计算相对速度 & 距离 & TTC ————
+    rel_v = v_ego - v_front;           % 正值：正在接近
+    dist  = double(front_loc.y - ego_loc.y);
+    if rel_v <= 0
+        TTC = Inf;
+    else
+        TTC = dist / rel_v;
+    end
+    
+    % ———— 3) 计算所需减速度 a_dec ————
+    if TTC > 2
+        a_dec = 4;   % m/s²，恒定减速度
+    else
+        % 动态调整：这里简单线性插值，使得 new_TTC ~=2
+        % 设想在下一个 dt 时间后，希望新TTC=2：
+        % (dist - v_rel*dt) / v_rel ≈ 2  => 调整 v_rel；但简单起见：
+        a_dec = min(8, (rel_v*dt + dist/2) / dt); 
+        % 你可以按实验需求改更精确公式
+    end
+    
+    % ———— 4) 换算为 CARLA brake 值 & 应用 control ————
+    brake_cmd = 0.5;
+    
+    ctrl = py.carla.VehicleControl();
+    ctrl.throttle = 0.0;
+    ctrl.steer    = 0.0;
+    ctrl.brake    = brake_cmd *2;
+    vehicle_ego.apply_control(ctrl);
+    
+    % ———— 5) 输出调试信息 ————
+    fprintf("t=%.2fs | v_ego=%.2f | v_front=%.2f | dist=%.2f | TTC=%.2f | a_dec=%.2f | brake=%.2f\n", ...
+        t_rel, v_ego, v_front, dist, TTC, a_dec, brake_cmd);
+    
+    % ———— 6) 停车检测 & 退出循环 ————
+    if abs(v_ego) < tol_v
+        fprintf("✅ 自车已停止，MRM 结束\n");
+        break;
+    end
+
+
+
+
+
+    % 读取后车位置与速度
+      rear_loc = vehicle_rear.get_location();
+      rear_vvec = vehicle_rear.get_velocity();
+      v_rear = double(rear_vvec.y);
+      dist_rear = double(ego_loc.y - rear_loc.y);
+
+     % 计算后方 TTC 与 THW
+      rel_v_rear = v_rear - v_ego;
+     TTC_rear = Inf;
+     if rel_v_rear > 0
+         TTC_rear = dist_rear / rel_v_rear;
+     end
+
+      THW_front = dist / max(v_ego, 0.1);  % 防除以0
+      THW_rear = dist_rear / max(v_rear, 0.1);
+
+     % 日志记录
+       t_log(end+1) = t_rel;
+       TTC_front_log(end+1) = TTC;
+       TTC_rear_log(end+1) = TTC_rear;
+       THW_front_log(end+1) = THW_front;
+       THW_rear_log(end+1) = THW_rear;
+end
+
+
+
+figure;
+plot(t_log, TTC_front_log, 'LineWidth', 1.5); hold on;
+plot(t_log, TTC_rear_log,  'LineWidth', 1.5);
+xlabel('Time [s]'); ylabel('TTC [s]');
+title('TTC with Front/Rear Vehicle'); legend('Front', 'Rear'); grid on;
+
+figure;
+plot(t_log, THW_front_log, 'LineWidth', 1.5); hold on;
+plot(t_log, THW_rear_log,  'LineWidth', 1.5);
+xlabel('Time [s]'); ylabel('THW [s]');
+title('THW with Front/Rear Vehicle'); legend('Front', 'Rear'); grid on;
