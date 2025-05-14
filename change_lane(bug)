@@ -1,0 +1,171 @@
+model3 = blueprints.filter('vehicle.tesla.model3');
+bp = cell(py.list(model3));
+bp = bp{1};
+
+spawn_points = py.list(map.get_spawn_points());
+ego_spawn  = spawn_points{99};  % 假设第99个spawn点
+ego_loc = ego_spawn.location;
+
+% ==== 生成自车 ====
+vehicle_ego = world.spawn_actor(bp, ego_spawn);
+
+% ==== 生成前后车 ====
+front_spawn = py.carla.Transform( ...
+    py.carla.Location(ego_loc.x + 3.5, ego_loc.y + 50, ego_loc.z), ... % 前方 50m 左车道
+    ego_spawn.rotation);
+rear_spawn = py.carla.Transform( ...
+    py.carla.Location(ego_loc.x + 3.5, ego_loc.y - 30, ego_loc.z), ... % 后方 30m 左车道
+    ego_spawn.rotation);
+
+vehicle_front = world.spawn_actor(bp, front_spawn);
+vehicle_rear  = world.spawn_actor(bp, rear_spawn);
+
+
+
+
+% ========== 启动 Python 控制器（后台运行） ==========
+python_path = 'E:\python39\python.exe';
+script_path = 'D:\CARLA\CARLA_0.9.15\WindowsNoEditor\PythonAPI\my_agent\behavior_agent_server.py';
+system(['start cmd /K "cd /d ', fileparts(script_path), ' && ', python_path, ' ', script_path, '"']);
+
+disp("✅ Python BehaviorAgent 控制器已启动");
+
+
+pause(10); 
+%vehicle_front.set_autopilot(true);
+%vehicle_rear.set_autopilot(true);
+
+
+% ==== 定义初速度（以世界坐标 x/y 方向为主）====
+v_init = 20;  % 初始速度 10 m/s，假设沿正Y方向行驶
+
+v_vector = py.carla.Vector3D(0, v_init, 0);
+
+%vehicle_ego.set_target_velocity(v_vector);
+vehicle_front.set_target_velocity(v_vector);
+vehicle_rear.set_target_velocity(v_vector);
+
+
+
+
+
+
+
+
+
+
+triggered = false;
+snap0 = world.wait_for_tick();
+t0 = snap0.timestamp.elapsed_seconds;
+
+
+
+
+prevSpeed = 0;
+dt      = 0.05;        % 与 world.wait_for_tick() 匹配
+g       = 9.8;         % 重力加速度，用于 brake 换算
+tol_v   = 0.1;         % 低速阈值：认为已停车
+
+% === 数据记录变量 ===
+t_vec          = [];
+v_ego_vec      = [];
+dist_rear_vec  = [];
+steer_vec      = [];
+
+
+
+    
+
+while ~triggered
+
+
+
+    snap = world.wait_for_tick();
+    simTime = snap.timestamp.elapsed_seconds;
+
+    % 计算相对时间（从 t0 开始）
+    
+      % … 等 10s 逻辑 …
+      % 进入 MRM 循环时，用相对时间
+     t_rel = simTime - t0;
+
+   
+
+    ego_loc = vehicle_ego.get_location();
+    rear_loc = vehicle_rear.get_location();
+
+
+
+    ego_vel = vehicle_ego.get_velocity();
+    v_ego = sqrt(double(ego_vel.x)^2 + double(ego_vel.y)^2 + double(ego_vel.z)^2);  % 速度大小
+
+
+    dist_rear = double(ego_loc.y - rear_loc.y);
+
+    if dist_rear < 0
+        fprintf("等待后车超过自车... 当前距差 = %.2f m\n", dist_rear);
+    else
+        fprintf("✅ 后车已超过自车，触发变道\n");
+
+        control_path = 'D:\CARLA\CARLA_0.9.15\WindowsNoEditor\PythonAPI\my_agent\control.txt';
+        fid = fopen(control_path, 'w');
+        fprintf(fid, 'change_lane_left');
+        fclose(fid);
+
+        disp("↪️ MATLAB 写入左变道命令");
+        triggered = true;
+    end
+
+
+
+
+   % === 记录数据 ===
+    t_vec(end+1)         = t_rel;
+    v_ego_vec(end+1)     = v_ego;
+    rear_loc             = vehicle_rear.get_location();
+    dist_rear_vec(end+1) = double(ego_loc.y - rear_loc.y);
+
+
+    actual_ctrl = vehicle_ego.get_control();
+    steer_vec(end+1) = double(actual_ctrl.steer);
+
+
+     % ———— 6) 停车检测 & 退出循环 ————
+    if abs(v_ego) < tol_v
+        fprintf("✅ 自车已停止，MRM 结束\n");
+        break;
+    end
+
+
+
+
+
+    
+end
+
+
+
+
+
+
+figure;
+subplot(3,1,1);
+plot(t_vec, v_ego_vec, 'LineWidth', 1.5);
+xlabel('Time (s)');
+ylabel('Ego Speed (m/s)');
+title('Ego Vehicle Speed vs. Time');
+grid on;
+
+subplot(3,1,2);
+plot(t_vec, dist_rear_vec, 'LineWidth', 1.5);
+xlabel('Time (s)');
+ylabel('Distance to Rear Vehicle (m)');
+title('Distance to Rear Vehicle vs. Time');
+grid on;
+
+subplot(3,1,3);
+plot(t_vec, steer_vec, 'LineWidth', 1.5);
+xlabel('Time (s)');
+ylabel('Steering Angle ([-1, 1])');
+title('Steering Control vs. Time');
+grid on;
